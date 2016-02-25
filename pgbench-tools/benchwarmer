@@ -1,0 +1,390 @@
+#!/bin/bash
+
+source ./config_temp
+
+# Take clients and rate limit from command line if passed, use defaults
+# otherwise
+
+# Clients
+if [ ! -z "$1" ]; then
+  CLIENTS="$1"
+elif [ -z "$CLIENTS" ]; then
+  CLIENTS=4
+fi
+
+# Rate limit
+if [ -n "$2" ]; then
+  RATE="$2"
+  RATEOPT="-R $2 "
+else
+  RATE="NULL"
+  RATEOPT=""
+fi
+
+# Query the test database and put its background writer statistics into
+# a set of environment variables, probably for use inserting stats into
+# the results database.
+#
+# This presumes that you have already set $BACKEND_FSYNC before
+# calling.
+function get_bgwriter {
+  BGW=`$TESTPSQL -A -t -F" " -c "select checkpoints_timed,checkpoints_req,buffers_checkpoint,buffers_clean,maxwritten_clean,buffers_backend,buffers_alloc,$BACKEND_FSYNC from pg_stat_bgwriter"`
+  set -- $BGW
+  checkpoints_timed=$1
+  checkpoints_req=$2
+  buffers_checkpoint=$3
+  buffers_clean=$4
+  maxwritten_clean=$5
+  buffers_backend=$6
+  buffers_alloc=$7
+  buffers_backend_fsync=$8
+}
+
+# Figure out how many transactions per client, then recompute
+# a new total; this copes with rounding issues
+if [ -z "$TOTTRANS" ] ; then
+  TOTTRANS=1000
+fi
+TRANS=`expr $TOTTRANS / $CLIENTS`
+TOTTRANS=`expr $TRANS \* $CLIENTS`
+
+# If a runtime has been specified instead, throw away the transaction counts
+# use it instead
+if [ -n "$RUNTIME" ] ; then
+  TESTLEN="-T $RUNTIME"
+  TOTTRANS=""
+else
+  TESTLEN="-t $TRANS"
+fi
+
+# Set WORKERS string so that the largest possible worker count
+# up to MAX_WORKERS is used, while still dividing CLIENTS into an
+# even number per worker.
+WORKERS=""
+NUM_WORKERS="1"
+
+if [ -n "$MAX_WORKERS" ] ; then
+
+  # Only bother with/allow adjustment to WORKERS if the max is >1.
+  # That keeps up out of trouble if using a pgbench before 9.0,
+  # where using any value for "-j" won't be allowed, as long as the
+  # config file we're given isn't setup incorrectly.
+
+  if [ "$MAX_WORKERS" -gt 1 ]; then
+    NUM_WORKERS=$MAX_WORKERS
+
+    while [ "$NUM_WORKERS" -gt 1 ]; do
+      (( remainder=$CLIENTS % $NUM_WORKERS ))
+      if [ $remainder -eq 0 ] ; then
+        break
+      fi
+      (( NUM_WORKERS = $NUM_WORKERS - 1 ))
+    done
+
+    WORKERS="-j ${NUM_WORKERS}"
+  fi
+fi
+
+# psql statements for the test database and the result database
+TESTPSQL="psql -h $TESTHOST -U $TESTUSER -p $TESTPORT -d $TESTDB"
+RESULTPSQL="psql -h $RESULTHOST -U $RESULTUSER -p $RESULTPORT -d $RESULTDB"
+echo Running tests using:  $TESTPSQL
+echo Storing results using:  $RESULTPSQL
+
+# See if this database has all the standard pgbench tables in it
+PGCOUNT=`$TESTPSQL -A -t -c "SELECT count(*)  FROM pg_stat_user_tables WHERE relname IN ('pgbench_history','pgbench_tellers','pgbench_accounts','pgbench_branches')"`
+if [ "$PGCOUNT" -eq 4 ] ; then
+  TABLEPREFIX="pgbench_"
+  PGBENCH_TABLES=1
+  echo Found standard pgbench tables with prefix=$TABLEPREFIX
+else
+  TABLEPREFIX=""
+  PGCOUNT=`$TESTPSQL -A -t -c "SELECT count(*)  FROM pg_stat_user_tables WHERE relname IN ('history','tellers','accounts','branches')"`
+  echo "count=$PGCOUNT"
+  if [ "$PGCOUNT" -eq 4 ] ; then
+    echo Found standard pgbench tables with prefix=$TABLEPREFIX
+    PGBENCH_TABLES=1
+  else
+    echo Did not find standard pgbench tables
+    PGBENCH_TABLES=0
+  fi
+fi
+
+# Determine database scale
+SCALE=0
+if [ "$PGBENCH_TABLES" -eq "1" ] ; then
+  SCALE=`$TESTPSQL -A -t -c "select count(*) from ${TABLEPREFIX}branches"`
+fi
+
+# Confirm we have a useful pgbench to run
+if [ ! -f $PGBENCHBIN ]; then
+  echo ERROR:  cannot find pgbench binary $PGBENCHBIN , aborting
+  exit
+fi
+
+# Find current test set
+SET=`$RESULTPSQL -A -t -c "select max(set) from testset"`
+if [ "$?" -ne "0" ]; then
+  echo ERROR:  Attempt to determine test set failed
+  # TODO Create a fake first set if this happens?  Right now,
+  # the likely case is that the test DDL was never added, which
+  # makes that sort of correction attempt unlikely to be useful
+  exit
+fi
+
+# Cleanup pgbench tables, unless we've been told to skip that
+if [ "$SKIPINIT" -ne "1" ]; then
+  echo Cleaning up database $TESTDB
+  if [ "$PGBENCH_TABLES" -eq "1" ] ; then
+    $TESTPSQL -c "truncate table ${TABLEPREFIX}history"
+  fi
+
+  # If the previous test ran recently and it did a cleanup, we should
+  # be safe to skip this possibly lengthy step.  "Recently" is defined
+  # as within 10 seconds of when the last test cleanup finished.  There
+  # is some margin for error here, particulary if processing the results
+  # latency log was very time consuming.  The price of making a mistake
+  # is just some extra run-time though, doing a redundant vacuum.  On
+  # databases sizes where the vacuum time is very long, its actually less
+  # likely that the results log is large.  Tests against large database
+  # tend to run slowly.
+  CLEANED=`$RESULTPSQL -A -t -c "SELECT EXISTS(SELECT 1 FROM tests WHERE cleanup IS NOT NULL AND ((now() - end_time) + cleanup) < '100 seconds'::interval ORDER BY test DESC LIMIT 1)"`
+  if [ "$CLEANED" = 'f' ] ; then
+    $TESTPSQL -c "vacuum analyze"
+  else
+    echo "Skipping vacuum, it was recently ran by the last test"
+  fi
+
+  # We want clean stats from the pg_stat_bgwriter, but those won't show up
+  # until after the checkpoint is done.  Wait a bit for the stats to update
+  STARTCHECK=`$TESTPSQL -At -c "SELECT checkpoints_req FROM pg_stat_bgwriter"`
+  $TESTPSQL -c "checkpoint"
+  echo "Waiting for checkpoint statistics"
+  while [ 1 ] ; do
+    CHECK=`$TESTPSQL -At -c "SELECT checkpoints_req FROM pg_stat_bgwriter"`
+    if [ "$CHECK" -gt "$STARTCHECK" ] ; then
+      break
+    fi 
+    sleep 1
+  done
+
+fi
+
+# Create the tests record
+DBSIZE=`$TESTPSQL -A -t -c "select pg_database_size('$TESTDB')"`
+$RESULTPSQL -q -c "insert into tests (script,clients,workers,set,scale,dbsize,rate_limit) values('$SCRIPT','$CLIENTS','$NUM_WORKERS','$SET','$SCALE','$DBSIZE',$RATE)"
+TEST=`$RESULTPSQL -A -t -c "select max(test) from tests"`
+if [ "$?" -ne "0" ]; then
+  echo ERROR  Can\'t read from tests table.  Was the test data installed?
+  exit
+fi
+
+if [ -z "$TEST" ]; then
+  echo ERROR:  Attempt to get a test number returned \"$TEST\", aborting
+  exit
+fi
+
+# Figure out if this version of PostgreSQL includes buffers_backend_fsync
+$TESTPSQL -c "SELECT buffers_backend_fsync FROM pg_stat_bgwriter" >> /dev/null 2>&1
+if [ "$?" -ne "0" ]; then
+  BACKEND_FSYNC="0"
+else
+  BACKEND_FSYNC="buffers_backend_fsync"
+fi
+
+# Grab starting values for statistics
+get_bgwriter
+START_WAL=`$TESTPSQL -A -t -F" " -c "select pg_current_xlog_location()"`
+$RESULTPSQL -c "insert into test_bgwriter(test,checkpoints_timed,checkpoints_req,buffers_checkpoint,buffers_clean,maxwritten_clean,buffers_backend,buffers_alloc,buffers_backend_fsync) values('$TEST','$checkpoints_timed','$checkpoints_req','$buffers_checkpoint','$buffers_clean','$maxwritten_clean','$buffers_backend','$buffers_alloc','$buffers_backend_fsync')"
+
+# Setup test directory tree
+echo This is test $TEST
+mkdir -p results/$TEST
+
+# Start background daemon collectors
+if [ "$OSDATA" -eq "1" ]; then
+  ./timed-os-stats vmstat > results/$TEST/vmstat.log &
+  VMSTAT=$!
+  ./timed-os-stats iostat > results/$TEST/iostat.log &
+  IOSTAT=$!
+  ./timed-os-stats meminfo > results/$TEST/meminfo.log &
+  MEMINFO=$!
+  
+fi
+
+# Run the main pgbench test
+cd results/$TEST
+echo Script $SCRIPT executing for $CLIENTS concurrent users... 1>&2
+$PGBENCHBIN -s $SCALE -l -n $TESTLEN -U $TESTUSER -h $TESTHOST -p $TESTPORT -c $CLIENTS $WORKERS $RATEOPT -M prepared $TESTDB -f $BASEDIR/$TESTDIR/$SCRIPT > results.txt &
+#$PGBENCHBIN -S -s $SCALE -l -n $TESTLEN -U $TESTUSER -h $TESTHOST -p $TESTPORT -c $CLIENTS $WORKERS $RATEOPT $TESTDB > results.txt &
+#$PGBENCHBIN -s $SCALE -l -n $TESTLEN -U $TESTUSER -h $TESTHOST -p $TESTPORT -c $CLIENTS $WORKERS $RATEOPT $TESTDB > results.txt &
+P=$!
+wait $P
+$RESULTPSQL -q -c "update tests set end_time=now() where test=$TEST"
+
+if [ "$OSDATA" -eq "1" ]; then
+  # The PIDs we have will be the process ID of the Python timed-os-stats
+  # process, but we must make sure to also kill the child processes (launched
+  # via subprocess.Popen()) so they are not lingering forever.
+  ../../kill_pg "${VMSTAT}"
+  ../../kill_pg "${IOSTAT}"
+  ../../kill_pg "${MEMINFO}"
+
+fi
+
+# Find largest dirty memory value (which is in kB)
+max_dirty=`cat meminfo.log | grep Dirty | awk '{print $4}' | sort -n | tail -n 1`
+if [ -z "$max_dirty" ] ; then
+ max_dirty=0 
+fi
+
+# Update bgwriter data with delta
+get_bgwriter
+$RESULTPSQL -c "update test_bgwriter set \
+  checkpoints_timed=$checkpoints_timed - checkpoints_timed,\
+  checkpoints_req=$checkpoints_req - checkpoints_req,\
+  buffers_checkpoint=$buffers_checkpoint - buffers_checkpoint,\
+  buffers_clean=$buffers_clean - buffers_clean,\
+  maxwritten_clean=$maxwritten_clean - maxwritten_clean,\
+  buffers_backend=$buffers_backend - buffers_backend,\
+  buffers_alloc=$buffers_alloc - buffers_alloc,\
+  buffers_backend_fsync=$buffers_backend_fsync - buffers_backend_fsync, \
+  max_dirty=1024 * '$max_dirty' \
+  where test='$TEST'"
+
+# WAL values are initially saved as text because they're pulled from the test
+# database--but the functions to turn them into numeric types is available
+# only in the results one.
+END_WAL=`$TESTPSQL -A -t -F" " -c "select pg_current_xlog_location()"`
+$RESULTPSQL -q -c "UPDATE tests SET wal_written=wal_lsn('$END_WAL') - wal_lsn('$START_WAL') WHERE test=$TEST"
+
+cat results.txt
+
+# Try to do the table cleanup before spoiling the database and OS cache by
+# touching the results heavily.  That means before reading pgbench.log,
+# which can be quite large on a fast server.
+if [ "$SKIPINIT" -ne "1" ]; then
+  echo Cleaning up database $TESTDB
+  if [ "$PGBENCH_TABLES" -eq "1" ] ; then
+    $TESTPSQL -c "truncate table ${TABLEPREFIX}history"
+  fi
+  VACUUMSTART=`$RESULTPSQL -A -t -c "SELECT now()"`
+  $TESTPSQL -c "vacuum"
+  $TESTPSQL -c "checkpoint"
+  $RESULTPSQL -q -c "UPDATE tests SET cleanup=now() - '$VACUUMSTART'::timestamp WHERE test=$TEST"
+fi
+
+# Save pgbench log
+# In the multi-threaded case, there may be a number of files, so copy
+# them all in
+cat pgbench_log.${P}* > pgbench.log
+echo Worst latency results:
+
+# TODO On Solaris, this may need to use /usr/xpg4/bin/tail instead
+cat pgbench.log | cut -f 3 -d " " | sort -n | tail -n 5
+
+tps=`grep "(including connections establishing)" results.txt | cut -d " " -f 3`
+trans=`grep "number of transactions actually processed:" results.txt | cut -d":" -f 2 | cut -d "/" -f 1`
+$RESULTPSQL -q -c "update tests set tps='$tps',trans='$trans' where test=$TEST"
+
+# Confirm we have an patched version of pgbench that has timestamps
+TESTFORTS=`cat pgbench.log | head -n 1 | cut -d" " -f 6`
+if [ -z "$TESTFORTS" ]; then
+  echo
+  echo "ERROR:  the pgbench used for this test is missing transaction"
+  echo timestamps.  No latency information will be imported into
+  echo the database, and no plots will be generated.
+  echo
+
+else
+
+  # Import timestamp information
+  $BASEDIR/log-to-csv $TEST < pgbench.log > timing.csv
+  $RESULTPSQL -c "copy timing from stdin with csv" < timing.csv
+
+  # Plot result graphs
+  $RESULTPSQL -A -t -F' ' -c "select extract(epoch from date_trunc('second',ts)),count(*) from timing where test=$TEST group by date_trunc('second',ts) order by date_trunc('second',ts)" > tpsdata.txt
+  gnuplot $BASEDIR/plots/tps.plot
+
+  $RESULTPSQL -A -t -F' ' -c "select extract(epoch from ts),latency from timing where test=$TEST" > latency.txt
+  gnuplot $BASEDIR/plots/latency.plot
+
+  $RESULTPSQL -q -c "update tests set avg_latency=(select avg(latency) from timing where tests.test=timing.test), max_latency=(select max(latency)from timing where tests.test=timing.test), percentile_90_latency=(select latency from timing where tests.test=timing.test order by latency offset (round(0.90*trans)) limit 1) where tests.test='$TEST'"
+
+  $BASEDIR/dirty-plot < meminfo.log > dirtydata.txt
+  gnuplot $BASEDIR/plots/dirty.plot
+
+  $BASEDIR/csv2gnuplot -i iostat.log -d iostat -t "pgbench disk writes" --disks="$DISKLIST" --diskstats="wMB/s"
+  mv graph.png iostat-writeMB.png
+
+  $BASEDIR/csv2gnuplot -i iostat.log -d iostat -t "pgbench disk reads" --disks="$DISKLIST" --diskstats="rMB/s"
+  mv graph.png iostat-readMB.png
+
+  $BASEDIR/csv2gnuplot -i iostat.log -d iostat -t "pgbench disk utilization" --disks="$DISKLIST" --diskstats="%util"
+  mv graph.png iostat-util.png
+
+  $BASEDIR/csv2gnuplot -i vmstat.log -d vmstat -t "pgbench vmstat"
+  mv graph.png vmstat.png
+fi
+
+cp $BASEDIR/templates/test-index.html index.html
+
+# Now that we're done plotting and computing stats, wipe the low-level
+# data we don't need anymore
+$RESULTPSQL -q -c "truncate table timing"
+
+# Save some configuration information about the server
+CLIENTHOST=`hostname`
+SERVERHOST="$TESTHOST"
+if [ "$SERVERHOST" = "localhost" ]; then
+  SERVERHOST="$CLIENTHOST"
+fi
+SETTINGS="pg_settings.txt"
+
+# Write out system and PostgreSQL installation
+echo Test results: > $SETTINGS
+$RESULTPSQL -c "select script,clients,round(tps) as tps,1000*round(avg_latency)/1000 as avg_latency,1000*round(max_latency)/1000 as max_latency from tests where test=$TEST" | grep -v " row)" >> $SETTINGS
+echo Server $SERVERHOST, client $CLIENTHOST >> $SETTINGS
+echo >> $SETTINGS
+echo "Server info and settings in postgresql.conf:" >> $SETTINGS
+$TESTPSQL -At -c "select version();" | grep -v " row" >> $SETTINGS
+$TESTPSQL -c "show data_directory" | grep -v " row" >> $SETTINGS
+$TESTPSQL -c "select name,current_setting(name) from pg_settings where source='configuration file' and not name in ('DateStyle','lc_messages','lc_monetary','lc_numeric','lc_time','listen_addresses','log_directory','log_rotation_age','log_rotation_size','log_truncate_on_rotation');" | grep -v " rows)" >> $SETTINGS
+
+# Operating system information
+echo >> $SETTINGS
+echo "benchmark client OS Configuration (may not be the same as the server)" >> $SETTINGS
+uname -a >> $SETTINGS
+
+# Linux OS release is likely to be in one or more of these files
+for f in `ls /etc/lsb-release /etc/debian_version /etc/redhat-release 2>/dev/null` ; do
+  echo $f: >> $SETTINGS
+  cat $f >> $SETTINGS
+  echo >> $SETTINGS
+done
+
+# Save version info on Mac OS X
+OSNAME=`uname`
+if [ "$OSNAME" = "Darwin" ] ; then
+  sw_vers >> $SETTINGS
+fi
+echo >> $SETTINGS
+
+if [ -d /proc/sys/vm/ ] ; then
+  for f in `ls /proc/sys/vm/dirty_*` ; do
+    S=`cat $f`
+    echo  $f=$S >> $SETTINGS
+  done
+  echo >> $SETTINGS
+fi
+
+mount >> $SETTINGS
+
+
+# Remove temporary files
+rm pgbench_log.${P}*
+rm pgbench.log
+rm timing.csv
+rm tpsdata.txt
+rm latency.txt
+rm dirtydata.txt

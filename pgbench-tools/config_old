@@ -1,0 +1,78 @@
+#
+#
+# Basic setup options.  If you are running as the postgres user and
+# are using PostgreSQL 8.4 or later, you normally don't need to
+# change any of these.
+#
+
+
+BASEDIR=`pwd`
+PGBENCHBIN=/home/sachin/postgres_install/bin/pgbench
+
+# These values are for pgbench 8.4 and later
+TESTDIR="tests"
+
+# Use these values for pgbench 8.3
+#TESTDIR="tests/tests-8.3"
+
+# SKIPINIT should be set to 1 either when simulating a cold cache, or
+# if you are not using the pgbench tables for your test
+SKIPINIT=1
+
+# Set TABBED to 1 to use Javascript for a multi-tabbed display format
+TABBED=0
+
+# Set OSDATA to 1 to collect OS data using vmstat and iostat
+OSDATA=1
+
+# Test/result database connection
+#TESTHOST=localhost
+#TESTUSER=sachin
+#TESTPORT=5432
+#TESTDB=pgbench
+
+RESULTHOST=localhost
+RESULTUSER=sachin
+RESULTPORT=5434
+RESULTDB=results
+
+#
+# Main test run customization
+#
+
+# Set this to a number only when using pgbench 9.0 or later.  This will set
+# the number of worker threads up to this maximum for each client count
+MAX_WORKERS="1"
+
+#SCRIPT="select.sql"
+#SCALES="1 10 100 1000"
+#SETCLIENTS="1 2 4 8 16 32"
+#SETTIMES=3
+
+#SCRIPT="select.sql"
+SCRIPT="update.sql"
+#SCRIPT="tpc-b.sql"
+#SCALES="2"
+SETCLIENTS="200"
+SETTIMES=1
+
+# RUNTIME is in seconds.  If it is specified, then TOTTRANS is ignored.
+# Setting a time instead of a transaction account is only available
+# in 8.4 and later.
+#RUNTIME=1800
+#TOTTRANS="100000"
+
+# Use a transaction count instead for 8.3 or earlier
+#RUNTIME=""
+#TOTTRANS=100000
+
+# Starting in the 9.4 pgbench, you can limit the maximum rate.
+# This takes a list like scale and clients
+SETRATES=""
+
+#
+# Parameters for system monitoring code
+#
+DISKLIST="sda"
+
+

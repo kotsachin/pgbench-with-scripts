@@ -1,0 +1,145 @@
+
+
+
+psql -d pgbench -p 5434 -c "COPY (SELECT aid, bid, abalance, filler from pgbench_accounts WHERE aid >=$1 AND aid<1001) TO STDOUT" | psql -d pgbench -h xxx.xxx.xxx.xxx -p 5434 -c "COPY pgbench_accounts_1 FROM STDIN"
+
+References:
+https://github.com/sh2/dstat2graphs
+https://github.com/gregs1104/pgbench-tools
+http://www.westnet.com/~gsmith/content/postgresql/pgbench-tools.htm
+
+https://hub.docker.com/_/centos/
+https://hub.docker.com/r/dharmamike/pmx-pgsql/
+https://jpetazzo.github.io/2013/10/16/configure-docker-bridge-network/
+http://stackoverflow.com/questions/23111631/cannot-download-docker-images-behind-a-proxy
+https://docs.docker.com/userguide/dockervolumes/
+http://stackoverflow.com/questions/22907231/copying-files-from-host-to-docker-container
+https://docs.docker.com/userguide/dockerlinks/
+http://stackoverflow.com/questions/22049212/docker-copy-file-from-container-to-host
+http://nareshv.blogspot.jp/2014/02/installing-docker-08-version-on-centos.html
+https://docs.docker.com/articles/networking/
+
+
+http://www.hammerdb.com/download.html
+http://www.cacti.net/
+
+------------------------
+ERROR:  integer out of range
+STATEMENT:  update test_bgwriter set   checkpoints_timed=12 - checkpoints_timed,  checkpoints_req=23 - checkpoints_req,  buffers_checkpoint=413 - buffers_checkpoint,  buffers_clean=0 - buffers_clean,  maxwritten_clean=0 - maxwritten_clean,  buffers_backend=147 - buffers_backend,  buffers_alloc=2427 - buffers_alloc,  buffers_backend_fsync=0 - buffers_backend_fsync,   max_dirty=1024 * '2713288'   where test='2'
+
+
+=========================
+mkdir -p postgres_install
+CFLAGS="-g -O0" ./configure --with-libxml --enable-cassert --enable-debug --enable-profiling --prefix=/home/sachin/postgres_install/ --with-python && gmake && gmake install
+
+du --max-depth=1 -h /home/sachin/postgres_data
+
+
+https://github.com/gregs1104/pgbench-tools.git
+
+
+
+mkdir -p postgres_data
+/home/sachin/postgres_install/bin/initdb -D /home/sachin/postgres_data/
+/home/sachin/postgres_install/bin/pg_ctl -D /home/sachin/postgres_data/ start
+
+/home/sachin/postgres_install/bin/pg_dump -a -d pgbench -p 5432 > pgbench_scale-2.dump
+/home/sachin/postgres_install/bin/pgbench -i -s 2 -d pgbench
+
+/home/sachin/postgres_install/bin/dropdb -p 5434 -h xxx.xxx.xxx.xxx -U sachin pgbench
+/home/sachin/postgres_install/bin/createdb -p 5434 -h xxx.xxx.xxx.xxx -U sachin pgbench
+
+/home/sachin/postgres_install/bin/pgbench -i -s 1100 -p 5434 -d pgbench
+COPY (SELECT aid, bid, abalance, filler from pgbench_accounts WHERE aid >=80000001 AND aid<90000001) TO '/home/sachin/child9.csv' WITH DELIMITER ',' CSV HEADER;
+
+mkdir -p $(date -I)
+
+cp -r results/* 2015-09-10/
+
+scp -r 2015-09-10/ sachin@192.168.1.101:/home/sachin/
+
+scp -r 2015-09-09/ sachin@172.20.16.19:/home/sachin/test/
+
+
+#mkdir -p /dev/shm/dstat2graphs
+#chown apache:apache /dev/shm/dstat2graphs
+/home/sachin/pgbench-tools/dstat2graphs/dstat2graphs.pl /home/sachin/test/results/4/report/child1/child_dstat_1.csv /home/sachin/test/results/4/report/child1/ 512 192 0 0 0 0
+----------------------
+
+http://www.liquidweb.com/kb/how-to-install-docker-on-centos-6/
+http://nareshv.blogspot.jp/2013/08/installing-dockerio-on-centos-64-64-bit.html
+
+https://registry.hub.docker.com/u/dharmamike/pmx-pgsql/
+========================
+CONTAINER=$(sudo docker run -d -p 5432 -t centos)
+CONTAINER_IP=$(sudo docker inspect $CONTAINER | grep IPAddress | awk '{ print $2 }' | tr -d ',"')
+
+psql -p5432 -h $CONTAINER_IP --username='docker' --password --list
+
+
+sudo docker run -i -t --net=host f75a7929918a /bin/bash
+
+
+echo "CREATE USER docker WITH SUPERUSER PASSWORD 'docker';" | \
+    su postgres sh -c "/usr/local/lib/postgresql/bin/postgres --single \
+    -D /var/lib/postgresql/data \
+    -c config_file=/var/lib/postgresql/data/postgresql.conf"
+
+
+su - postgres -c "/usr/local/lib/postgresql/bin/initdb -D /var/lib/postgresql/data"
+
+su - postgres -c "/usr/local/lib/postgresql/bin/createuser  docker"
+
+
+
+sudo docker exec 36f0949129b2 /bin/bash
+
+sudo docker build -t centos-postgresql-source Dockerfile
+
+sudo docker run -d -p 5433 -t centos-postgresql-source /bin/bash
+sudo docker exec $CONTAINER  /etc/init.d/postgresql start
+
+sudo docker stop $(sudo docker ps -aq)
+sudo docker rm $(sudo docker ps -aq)
+
+
+sudo docker cp 6a742283a9b5:/a.txt /home/sachin/
+
+
+-------------------
+
+/home/sachin/postgres_install/bin/pgbench -d pgbench -p 5432 -S -T 1800 -c 10 -j 2 -l > results/scale-2_select_only_3.log
+
+/home/sachin/postgres_install/bin/pgbench -f tests/select.sql -s 2 -T 180 -U sachin -h localhost -p 5432 -c 10 -j 2 -l --aggregate-interval=1 -d pgbench > results/scale-2_select_only_3.log
+
+
+/home/sachin/postgres_install/bin/pgbench -d pgbench -p 5432 -S -T 180 -c 10 -j 2 -l --aggregate-interval=1 > test_result.log
+
+
+psql -f /home/sachin/pgbench-tools/init/resultdb.sql -d results
+
+
+dstat -tvfN net/docker0,net/p2p1 --output log.csv 1
+
+net/docker0 
+
+
+yum install gnuplot
+
+yum install sysstat
+
+yum install python-dateutil
+
+
+
+yum install dstat
+
+dstat -tvfn --output log.csv 1
+---------------
+perl -MLWP -e 0
+
+yum install cpan LWP
+
+cpan HTML::Entities
+
+
